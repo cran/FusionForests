@@ -1,0 +1,878 @@
+#include "StanForestFunctions.h"
+
+
+// Numerically stable log-sum-exp: log( sum_i exp(v[i]) ).
+// Declared in Prerequisites.h; used by Random::log_dirichlet and
+// DrawSparsityParameter.
+double LogSumExp(std::vector<double>& v)
+{
+  double max_val = v[0];
+  for (size_t i = 0; i < v.size(); i++)
+    if (v[i] > max_val) max_val = v[i];
+
+  double sum = 0.0;
+  for (size_t i = 0; i < v.size(); i++)
+    sum += std::exp(v[i] - max_val);
+
+  return max_val + std::log(sum);
+}
+
+
+// Build a CutpointMatrix from the feature matrix x (column-major, n x p).
+// If nc != nullptr, nc[v] uniform cutpoints are created for each predictor v.
+// If nc == nullptr, the unique observed values are used as cutpoints.
+void MakeCutpoints(size_t p, size_t n, double* x, CutpointMatrix& cutpoints,
+                   int* nc)
+{
+  cutpoints.resize(p);
+
+  if (nc != nullptr) {
+    // Uniform cutpoints: find min/max per predictor and build a grid.
+    std::vector<double> min_val(p,  std::numeric_limits<double>::infinity());
+    std::vector<double> max_val(p, -std::numeric_limits<double>::infinity());
+
+    for (size_t i = 0; i < p; i++) {
+      for (size_t j = 0; j < n; j++) {
+        double value = *(x + p * j + i);
+        if (std::isnan(value)) continue;
+        if (value < min_val[i]) min_val[i] = value;
+        if (value > max_val[i]) max_val[i] = value;
+      }
+    }
+
+    for (size_t i = 0; i < p; i++) {
+      if (min_val[i] > max_val[i]) {
+        // All values are NaN for this predictor — no valid cutpoints.
+        cutpoints[i].clear();
+        continue;
+      }
+      size_t num_cuts = nc[i];
+      double delta    = (max_val[i] - min_val[i]) / (num_cuts + 1.0);
+      cutpoints[i].resize(num_cuts);
+      for (size_t j = 0; j < num_cuts; j++) {
+        cutpoints[i][j] = min_val[i] + (j + 1) * delta;
+      }
+    }
+
+  } else {
+    // Empirical cutpoints: unique sorted observed values per predictor.
+    for (size_t i = 0; i < p; i++) {
+      std::vector<double> observed;
+      observed.reserve(n);
+      for (size_t j = 0; j < n; j++) {
+        double value = *(x + p * j + i);
+        if (!std::isnan(value)) observed.push_back(value);
+      }
+
+      std::sort(observed.begin(), observed.end());
+      auto last = std::unique(observed.begin(), observed.end());
+      observed.erase(last, observed.end());
+      cutpoints[i] = observed;
+    }
+  }
+}
+
+// Return the birth probability and fill splittable_leaves with all leaf nodes
+// that can be split.
+double GetBirthProbability(StanTree& tree, CutpointMatrix& cutpoints,
+                           PriorInfo& prior_info,
+                           std::vector<StanTree*>& splittable_leaves)
+{
+  std::vector<StanTree*> all_leaves;
+  tree.CollectLeaves(all_leaves);
+
+  for (size_t i = 0; i < all_leaves.size(); i++) {
+    if (CanSplit(all_leaves[i], cutpoints))
+      splittable_leaves.push_back(all_leaves[i]);
+  }
+
+  if (splittable_leaves.empty()) return 0.0;
+  if (tree.TreeSize() == 1) return 1.0; // Single-node tree must grow
+  return prior_info.prob_birth;
+}
+
+// Compute weighted sufficient statistics for the two children of a proposed
+// split.  When data_info.weights == nullptr, weights are taken to be 1.
+void GetSufficientStatistics(StanTree& tree, StanTree* target_leaf,
+                             size_t split_var, size_t cut_val,
+                             CutpointMatrix& cutpoints, DataInfo& data_info,
+                             size_t& left_count,
+                             double& left_weight_sum,
+                             double& left_weighted_residual_sum,
+                             size_t& right_count,
+                             double& right_weight_sum,
+                             double& right_weighted_residual_sum)
+{
+  left_count = 0;  left_weight_sum  = 0.0; left_weighted_residual_sum  = 0.0;
+  right_count = 0; right_weight_sum = 0.0; right_weighted_residual_sum = 0.0;
+  const double* w = data_info.weights;
+
+  for (size_t i = 0; i < data_info.n; i++) {
+    double* x_row = data_info.X + i * data_info.p;
+    if (target_leaf == tree.FindLeaf(x_row, cutpoints)) {
+      double weight = (w == nullptr) ? 1.0 : w[i];
+      if (x_row[split_var] < cutpoints[split_var][cut_val]) {
+        left_count++;
+        left_weight_sum            += weight;
+        left_weighted_residual_sum += weight * data_info.residuals[i];
+      } else {
+        right_count++;
+        right_weight_sum            += weight;
+        right_weighted_residual_sum += weight * data_info.residuals[i];
+      }
+    }
+  }
+}
+
+// Compute weighted sufficient statistics for an existing left/right leaf pair.
+void GetSufficientStatistics(StanTree& tree, StanTree* left_leaf,
+                             StanTree* right_leaf,
+                             CutpointMatrix& cutpoints, DataInfo& data_info,
+                             size_t& left_count,
+                             double& left_weight_sum,
+                             double& left_weighted_residual_sum,
+                             size_t& right_count,
+                             double& right_weight_sum,
+                             double& right_weighted_residual_sum)
+{
+  left_count = 0;  left_weight_sum  = 0.0; left_weighted_residual_sum  = 0.0;
+  right_count = 0; right_weight_sum = 0.0; right_weighted_residual_sum = 0.0;
+  const double* w = data_info.weights;
+
+  for (size_t i = 0; i < data_info.n; i++) {
+    double* x_row = data_info.X + i * data_info.p;
+    const StanTree* leaf = tree.FindLeaf(x_row, cutpoints);
+    double weight = (w == nullptr) ? 1.0 : w[i];
+    if (leaf == left_leaf) {
+      left_count++;
+      left_weight_sum            += weight;
+      left_weighted_residual_sum += weight * data_info.residuals[i];
+    }
+    if (leaf == right_leaf) {
+      right_count++;
+      right_weight_sum            += weight;
+      right_weighted_residual_sum += weight * data_info.residuals[i];
+    }
+  }
+}
+
+// Weighted Gaussian leaf-marginal log-likelihood.  When weight_sum equals
+// the observation count (i.e. all weights are 1), this reduces to the
+// standard BART formula.
+double LogLikelihood(double weight_sum, double weighted_residual_sum,
+                     double sigma, double eta)
+{
+  double sigma_squared  = sigma * sigma;
+  double prior_variance = eta * eta;
+  double precision_sum  = weight_sum * prior_variance + sigma_squared;
+  return -0.5 * std::log(precision_sum)
+         + (prior_variance * weighted_residual_sum * weighted_residual_sum)
+           / (2.0 * sigma_squared * precision_sum);
+}
+
+// Probability that a node grows; 0 if no valid split variable is available.
+double ProbabilityNodeGrows(StanTree* node, CutpointMatrix& cutpoints,
+                            PriorInfo& prior_info)
+{
+  if (CanSplit(node, cutpoints)) {
+    return prior_info.base /
+      std::pow(1.0 + static_cast<double>(node->NodeDepth()), prior_info.power);
+  } else {
+    return 0.0;
+  }
+}
+
+// Compute weighted sufficient statistics for every leaf in a single data
+// pass.  Each leaf's weight_sum is Sum w_i and weighted_residual_sum is
+// Sum w_i * r_i (or, when weights == nullptr, the observation count and
+// the unweighted residual sum).
+void GetAllLeafStatistics(StanTree& tree, CutpointMatrix& cutpoints,
+                          DataInfo& data_info,
+                          std::vector<StanTree*>& leaves,
+                          std::vector<double>& weight_sums,
+                          std::vector<double>& weighted_residual_sums)
+{
+  leaves.clear();
+  tree.CollectLeaves(leaves);
+
+  size_t num_leaves = leaves.size();
+  weight_sums.assign(num_leaves, 0.0);
+  weighted_residual_sums.assign(num_leaves, 0.0);
+
+  std::map<const StanTree*, size_t> leaf_index_map;
+  for (size_t i = 0; i < num_leaves; i++) {
+    leaf_index_map[leaves[i]] = i;
+  }
+
+  const double* w = data_info.weights;
+  for (size_t i = 0; i < data_info.n; i++) {
+    double* x_row        = data_info.X + i * data_info.p;
+    const StanTree* leaf = tree.FindLeaf(x_row, cutpoints);
+    size_t leaf_index    = leaf_index_map[leaf];
+    double weight        = (w == nullptr) ? 1.0 : w[i];
+    weight_sums[leaf_index]            += weight;
+    weighted_residual_sums[leaf_index] += weight * data_info.residuals[i];
+  }
+}
+
+// Draw new step heights for all leaves from their Gaussian posteriors.
+void DrawAllLeafMeans(StanTree& tree, CutpointMatrix& cutpoints,
+                      DataInfo& data_info, PriorInfo& prior_info,
+                      double sigma, Random& random)
+{
+  std::vector<StanTree*> leaves;
+  std::vector<double>    weight_sums;
+  std::vector<double>    weighted_residual_sums;
+  GetAllLeafStatistics(tree, cutpoints, data_info, leaves,
+                       weight_sums, weighted_residual_sums);
+
+  for (size_t i = 0; i < leaves.size(); i++) {
+    leaves[i]->SetStepHeight(
+      DrawLeafMean(weight_sums[i], weighted_residual_sums[i],
+                   prior_info.eta, sigma, random));
+  }
+}
+
+// Generate a birth proposal.
+void BirthProposal(StanTree& tree, CutpointMatrix& cutpoints,
+                   PriorInfo& prior_info,
+                   std::vector<StanTree*>& splittable_leaves,
+                   double& prob_birth, StanTree*& target_leaf,
+                   size_t& split_var, size_t& cut_val,
+                   double& log_proposal_ratio,
+                   std::vector<size_t>& variable_split_counts,
+                   std::vector<double>& split_probabilities,
+                   bool use_augmentation, Random& random)
+{
+  // Draw the target leaf uniformly from splittable leaves.
+  size_t leaf_index = static_cast<size_t>(
+    std::floor(random.uniform() * splittable_leaves.size()));
+  target_leaf = splittable_leaves[leaf_index];
+
+  std::vector<size_t> good_vars;
+  int lower_bound = 0, upper_bound = 0;
+
+  if (!use_augmentation) {
+    // Degenerate trees strategy (Linero Assumption 2.2):
+    // draw split_var with probability proportional to split_probabilities.
+    GetSplittableVariables(target_leaf, cutpoints, good_vars);
+    random.SetInclusionWeights(split_probabilities);
+    split_var   = random.discrete();
+    lower_bound = 0;
+    upper_bound = static_cast<int>(cutpoints[split_var].size()) - 1;
+    if (!std::binary_search(good_vars.begin(), good_vars.end(), split_var)) {
+      // Variable not splittable here: use the constrained cut.
+      cut_val = target_leaf->GetConstrainedCut(split_var);
+    } else {
+      target_leaf->FindRegionBounds(split_var, &lower_bound, &upper_bound);
+      cut_val = lower_bound + static_cast<size_t>(
+        std::floor(random.uniform() * (upper_bound - lower_bound + 1)));
+    }
+
+  } else {
+    // Modified data-augmentation strategy (Linero Mod. Assumption 2.1):
+    // draw split_var only from the good variables, augment bad-variable counts.
+    std::vector<size_t> bad_vars;
+    std::vector<double> prob_good_vars;
+    std::vector<double> prob_bad_vars;
+    GetSplittableVariables(target_leaf, cutpoints, good_vars);
+
+    size_t num_bad_vars  = 0;
+    double prob_sum_good = 0.0;
+    double prob_sum_bad  = 0.0;
+
+    for (size_t j = 0; j < split_probabilities.size(); j++) {
+      if (good_vars[j - num_bad_vars] != j) {
+        bad_vars.push_back(j);
+        prob_bad_vars.push_back(split_probabilities[j]);
+        prob_sum_bad += split_probabilities[j];
+        num_bad_vars++;
+      } else {
+        prob_good_vars.push_back(split_probabilities[j]);
+        prob_sum_good += split_probabilities[j];
+      }
+    }
+
+    random.SetInclusionWeights(prob_good_vars);
+    split_var = good_vars[random.discrete()];
+
+    if (num_bad_vars != 0) {
+      for (size_t j = 0; j < num_bad_vars; j++) {
+        variable_split_counts[bad_vars[j]] +=
+          (1.0 / prob_sum_good) *
+          (split_probabilities[bad_vars[j]] / prob_sum_bad);
+      }
+    }
+
+    lower_bound = 0;
+    upper_bound = static_cast<int>(cutpoints[split_var].size()) - 1;
+    target_leaf->FindRegionBounds(split_var, &lower_bound, &upper_bound);
+    cut_val = lower_bound + static_cast<size_t>(
+      std::floor(random.uniform() * (upper_bound - lower_bound + 1)));
+  }
+
+  // Compute the Metropolis ratio components.
+  double prob_choose_leaf = 1.0 / splittable_leaves.size();
+  size_t leaf_depth       = target_leaf->NodeDepth();
+  double prob_grow_leaf   = prior_info.base /
+    std::pow(1.0 + static_cast<double>(leaf_depth), prior_info.power);
+
+  double prob_grow_left, prob_grow_right;
+  if (good_vars.size() > 1) {
+    prob_grow_left  = prior_info.base /
+      std::pow(1.0 + leaf_depth + 1.0, prior_info.power);
+    prob_grow_right = prob_grow_left;
+  } else {
+    prob_grow_left = ((int)(cut_val - 1) < lower_bound)
+      ? 0.0
+      : prior_info.base / std::pow(1.0 + leaf_depth + 1.0, prior_info.power);
+    prob_grow_right = (upper_bound < (int)(cut_val + 1))
+      ? 0.0
+      : prior_info.base / std::pow(1.0 + leaf_depth + 1.0, prior_info.power);
+  }
+
+  double prob_death_proposed;
+  if (splittable_leaves.size() > 1) {
+    prob_death_proposed = 1.0 - prior_info.prob_birth;
+  } else {
+    prob_death_proposed = ((prob_grow_right == 0.0) && (prob_grow_left == 0.0))
+      ? 1.0
+      : 1.0 - prior_info.prob_birth;
+  }
+
+  size_t num_nogs       = tree.NumberOfNogs();
+  StanTree* leaf_parent = target_leaf->GetParent();
+  double prob_choose_nog;
+  if (leaf_parent == nullptr) {
+    prob_choose_nog = 1.0;
+  } else {
+    prob_choose_nog = (leaf_parent->NodeType() == 'n')
+      ? 1.0 / num_nogs
+      : 1.0 / (num_nogs + 1.0);
+  }
+
+  log_proposal_ratio =
+    (prob_grow_leaf * (1.0 - prob_grow_left) * (1.0 - prob_grow_right) *
+     prob_death_proposed * prob_choose_nog) /
+    ((1.0 - prob_grow_leaf) * prob_choose_leaf * prob_birth);
+}
+
+// Generate a death proposal.
+void DeathProposal(StanTree& tree, CutpointMatrix& cutpoints,
+                   PriorInfo& prior_info,
+                   std::vector<StanTree*>& splittable_leaves,
+                   double& prob_birth, StanTree*& nog_node,
+                   double& log_proposal_ratio, Random& random)
+{
+  std::vector<StanTree*> nog_nodes;
+  tree.CollectNogs(nog_nodes);
+  size_t nog_index = static_cast<size_t>(
+    std::floor(random.uniform() * nog_nodes.size()));
+  nog_node = nog_nodes[nog_index];
+
+  size_t nog_depth     = nog_node->NodeDepth();
+  double prob_grow_nog = prior_info.base /
+    std::pow(1.0 + static_cast<double>(nog_depth), prior_info.power);
+
+  double prob_grow_left_child  = ProbabilityNodeGrows(nog_node->GetLeft(),
+                                                      cutpoints, prior_info);
+  double prob_grow_right_child = ProbabilityNodeGrows(nog_node->GetRight(),
+                                                      cutpoints, prior_info);
+
+  double prob_birth_proposed = (nog_node->NodeType() == 't')
+    ? 1.0
+    : prior_info.prob_birth;
+
+  int num_splittable_proposed = static_cast<int>(splittable_leaves.size());
+  if (CanSplit(nog_node->GetLeft(),  cutpoints)) --num_splittable_proposed;
+  if (CanSplit(nog_node->GetRight(), cutpoints)) --num_splittable_proposed;
+  ++num_splittable_proposed;
+  double prob_choose_leaf_proposed = 1.0 / num_splittable_proposed;
+
+  double prob_death_current      = 1.0 - prob_birth;
+  double prob_choose_nog_current = 1.0 / nog_nodes.size();
+
+  log_proposal_ratio =
+    ((1.0 - prob_grow_nog) * prob_birth_proposed * prob_choose_leaf_proposed) /
+    (prob_grow_nog * (1.0 - prob_grow_left_child) *
+     (1.0 - prob_grow_right_child) * prob_death_current *
+     prob_choose_nog_current);
+}
+
+// Draw a single leaf mean from its Gaussian posterior using weighted
+// sufficient statistics (weight_sum = Sum w_i,
+// weighted_residual_sum = Sum w_i * r_i).  When all weights are 1, this
+// reduces to the standard BART leaf-mean update.
+double DrawLeafMean(double weight_sum, double weighted_residual_sum,
+                    double eta, double sigma, Random& random)
+{
+  double sigma_squared   = sigma * sigma;
+  double precision_data  = weight_sum / sigma_squared;
+  double precision_prior = 1.0 / (eta * eta);
+  return (weighted_residual_sum / sigma_squared)
+           / (precision_prior + precision_data)
+         + random.normal() / std::sqrt(precision_prior + precision_data);
+}
+
+// Draw the splitting probability vector from a Dirichlet posterior.
+void DrawSplitProbabilities(std::vector<size_t>& variable_split_counts,
+                            std::vector<double>& log_split_probabilities,
+                            double& dart_theta, Random& random)
+{
+  size_t p = variable_split_counts.size();
+  std::vector<double> dirichlet_params(p);
+  for (size_t j = 0; j < p; j++) {
+    dirichlet_params[j] = dart_theta / static_cast<double>(p)
+                          + static_cast<double>(variable_split_counts[j]);
+  }
+  log_split_probabilities = random.log_dirichlet(dirichlet_params);
+}
+
+// Draw the Dirichlet sparsity parameter theta from a grid approximation.
+void DrawSparsityParameter(bool fixed_theta, double& dart_theta,
+                           std::vector<double>& log_split_probabilities,
+                           double dart_a, double dart_b, double dart_rho,
+                           Random& random)
+{
+  // Model: theta / (theta + rho) ~ Beta(dart_a, dart_b).
+  // Grid over lambda = theta / (theta + rho) in {1/1001, ..., 1000/1001}.
+  if (fixed_theta) return;
+
+  size_t p = log_split_probabilities.size();
+  double sum_log_probs = 0.0;
+  for (size_t j = 0; j < p; j++) sum_log_probs += log_split_probabilities[j];
+
+  const size_t grid_size = 1000;
+  std::vector<double> lambda_grid(grid_size);
+  std::vector<double> theta_grid(grid_size);
+  std::vector<double> log_weights(grid_size);
+
+  for (size_t k = 0; k < grid_size; k++) {
+    lambda_grid[k] = static_cast<double>(k + 1) / 1001.0;
+    theta_grid[k]  = (lambda_grid[k] * dart_rho) / (1.0 - lambda_grid[k]);
+
+    double theta_log_lik =
+      std::lgamma(theta_grid[k])
+      - static_cast<double>(p) *
+        std::lgamma(theta_grid[k] / static_cast<double>(p))
+      + (theta_grid[k] / static_cast<double>(p)) * sum_log_probs;
+
+    double beta_log_prior =
+      (dart_a - 1.0) * std::log(lambda_grid[k])
+      + (dart_b - 1.0) * std::log(1.0 - lambda_grid[k]);
+
+    log_weights[k] = theta_log_lik + beta_log_prior;
+  }
+
+  double log_normalizer = LogSumExp(log_weights);
+  for (size_t k = 0; k < grid_size; k++) {
+    log_weights[k] = std::exp(log_weights[k] - log_normalizer);
+  }
+
+  random.SetInclusionWeights(log_weights);
+  dart_theta = theta_grid[random.discrete()];
+}
+
+
+// ===== Informed Random Splitting (IRS) =====
+
+// Compute the informed routing probability P(go left).
+double ComputeIRSProbability(double residual_i,
+                             size_t n_left, double sum_left,
+                             size_t n_right, double sum_right,
+                             double sigma, double tau_h)
+{
+  double sigma2    = sigma * sigma;
+  double tau_h2    = tau_h * tau_h;
+  double prec_prior = 1.0 / tau_h2;
+
+  // Left child posterior predictive
+  double prec_left  = static_cast<double>(n_left) / sigma2;
+  double hat_h_left = (n_left > 0)
+    ? (sum_left / sigma2) / (prec_prior + prec_left)
+    : 0.0;
+  double hat_v_left = 1.0 / (prec_prior + prec_left);
+  double total_var_left = sigma2 + hat_v_left;
+
+  // Right child posterior predictive
+  double prec_right  = static_cast<double>(n_right) / sigma2;
+  double hat_h_right = (n_right > 0)
+    ? (sum_right / sigma2) / (prec_prior + prec_right)
+    : 0.0;
+  double hat_v_right = 1.0 / (prec_prior + prec_right);
+  double total_var_right = sigma2 + hat_v_right;
+
+  // Log predictive densities
+  double diff_left  = residual_i - hat_h_left;
+  double diff_right = residual_i - hat_h_right;
+  double log_phi_left  = -0.5 * std::log(total_var_left)
+                         - 0.5 * diff_left  * diff_left  / total_var_left;
+  double log_phi_right = -0.5 * std::log(total_var_right)
+                         - 0.5 * diff_right * diff_right / total_var_right;
+
+  // Log-sum-exp for numerical stability
+  double pi = 1.0 / (1.0 + std::exp(log_phi_right - log_phi_left));
+
+  // Clamp to avoid degenerate probabilities
+  if (pi < 0.01) pi = 0.01;
+  if (pi > 0.99) pi = 0.99;
+
+  return pi;
+}
+
+// Draw routing indicators for a newly born internal node.
+// irs_mode: 1/2 = informed routing, 3 = uniform P=0.5.
+void DrawRoutingIndicators(
+    StanTree* node, size_t split_var, size_t cut_val,
+    CutpointMatrix& cutpoints, StanTree& tree_root,
+    DataInfo& data_info, double sigma, double tau_h,
+    RoutingMap& routing_map, Random& random, int irs_mode)
+{
+  size_t n = data_info.n;
+  size_t p = data_info.p;
+
+  // Allocate routing vector for this node
+  std::vector<int8_t> indicators(n, 0);
+
+  // Pass 1: route non-NaN observations, accumulate sufficient stats
+  size_t left_count = 0, right_count = 0;
+  double left_sum = 0.0, right_sum = 0.0;
+  std::vector<size_t> nan_obs;
+
+  for (size_t i = 0; i < n; i++) {
+    double* x_row = data_info.X + i * p;
+    // Check if this observation reaches this node
+    StanTree* leaf = tree_root.FindLeaf(x_row, i, cutpoints, routing_map);
+    // After birth, node's children are leaves. An obs that was in this leaf
+    // before birth now needs to be routed. Check if obs lands in either child.
+    if (leaf != node->GetLeft() && leaf != node->GetRight()) continue;
+
+    if (std::isnan(x_row[split_var])) {
+      nan_obs.push_back(i);
+    } else {
+      indicators[i] = 0;  // deterministic
+      if (x_row[split_var] < cutpoints[split_var][cut_val]) {
+        left_count++;
+        left_sum += data_info.residuals[i];
+      } else {
+        right_count++;
+        right_sum += data_info.residuals[i];
+      }
+    }
+  }
+
+  // Pass 2: route NaN observations
+  for (size_t idx : nan_obs) {
+    double pi = (irs_mode == 3)
+      ? 0.5
+      : ComputeIRSProbability(
+          data_info.residuals[idx],
+          left_count, left_sum, right_count, right_sum,
+          sigma, tau_h);
+
+    if (random.uniform() < pi) {
+      indicators[idx] = 1;   // go left
+      left_count++;
+      left_sum += data_info.residuals[idx];
+    } else {
+      indicators[idx] = -1;  // go right
+      right_count++;
+      right_sum += data_info.residuals[idx];
+    }
+  }
+
+  routing_map[node] = std::move(indicators);
+}
+
+// Gibbs-redraw routing at all nog nodes in the tree.
+// irs_mode: 1/2 = informed routing, 3 = uniform P=0.5.
+void RedrawNogRouting(
+    StanTree& tree, CutpointMatrix& cutpoints,
+    DataInfo& data_info, double sigma, double tau_h,
+    RoutingMap& routing_map, Random& random, int irs_mode)
+{
+  size_t n = data_info.n;
+  size_t p = data_info.p;
+
+  for (auto& entry : routing_map) {
+    StanTree* node = entry.first;
+    if (!node->IsNog()) continue;
+
+    std::vector<int8_t>& indicators = entry.second;
+    size_t sv = node->GetSplitVar();
+    size_t cv = node->GetCutVal();
+
+    // Pass 1: accumulate sufficient stats from non-NaN observations
+    size_t left_count = 0, right_count = 0;
+    double left_sum = 0.0, right_sum = 0.0;
+    std::vector<size_t> nan_obs;
+
+    for (size_t i = 0; i < n; i++) {
+      if (indicators[i] == 0) {
+        // Not missing at this node — check if this obs even reaches this node
+        double* x_row = data_info.X + i * p;
+        if (!std::isnan(x_row[sv])) {
+          // Only count if this obs actually goes through this node.
+          // We check by traversing; if the obs reaches either child, it's here.
+          StanTree* leaf = tree.FindLeaf(x_row, i, cutpoints, routing_map);
+          // Check if leaf is a descendant of this node
+          StanTree* left_child  = node->GetLeft();
+          StanTree* right_child = node->GetRight();
+          if (leaf == left_child) {
+            left_count++;
+            left_sum += data_info.residuals[i];
+          } else if (leaf == right_child) {
+            right_count++;
+            right_sum += data_info.residuals[i];
+          }
+        }
+      } else {
+        // This is a NaN observation at this node — mark for redraw
+        nan_obs.push_back(i);
+      }
+    }
+
+    // Pass 2: redraw NaN observations
+    for (size_t idx : nan_obs) {
+      double pi = (irs_mode == 3)
+        ? 0.5
+        : ComputeIRSProbability(
+            data_info.residuals[idx],
+            left_count, left_sum, right_count, right_sum,
+            sigma, tau_h);
+
+      if (random.uniform() < pi) {
+        indicators[idx] = 1;   // go left
+        left_count++;
+        left_sum += data_info.residuals[idx];
+      } else {
+        indicators[idx] = -1;  // go right
+        right_count++;
+        right_sum += data_info.residuals[idx];
+      }
+    }
+  }
+}
+
+// Remove routing indicators for a dying node.
+void RemoveRoutingIndicators(StanTree* dying_node, RoutingMap& routing_map)
+{
+  routing_map.erase(dying_node);
+}
+
+// Draw-then-decide: draw routing for NaN obs BEFORE birth, include them in stats.
+void DrawRoutingAndGetSufficientStatistics(
+    StanTree& tree, StanTree* target_leaf,
+    size_t split_var, size_t cut_val,
+    CutpointMatrix& cutpoints, DataInfo& data_info,
+    double sigma, double tau_h,
+    size_t& left_count, double& left_sum,
+    size_t& right_count, double& right_sum,
+    std::vector<int8_t>& tentative_indicators,
+    RoutingMap& routing_map, Random& random)
+{
+  size_t n = data_info.n;
+  size_t p = data_info.p;
+
+  left_count = 0;  left_sum  = 0.0;
+  right_count = 0; right_sum = 0.0;
+  tentative_indicators.assign(n, 0);
+  std::vector<size_t> nan_obs;
+
+  // Pass 1: route non-NaN observations deterministically
+  for (size_t i = 0; i < n; i++) {
+    double* x_row = data_info.X + i * p;
+    if (target_leaf != tree.FindLeaf(x_row, i, cutpoints, routing_map)) continue;
+
+    if (std::isnan(x_row[split_var])) {
+      nan_obs.push_back(i);
+    } else if (x_row[split_var] < cutpoints[split_var][cut_val]) {
+      left_count++;
+      left_sum += data_info.residuals[i];
+    } else {
+      right_count++;
+      right_sum += data_info.residuals[i];
+    }
+  }
+
+  // Pass 2: draw routing for NaN observations and include in stats
+  for (size_t idx : nan_obs) {
+    double pi = ComputeIRSProbability(
+      data_info.residuals[idx],
+      left_count, left_sum, right_count, right_sum,
+      sigma, tau_h);
+
+    if (random.uniform() < pi) {
+      tentative_indicators[idx] = 1;   // go left
+      left_count++;
+      left_sum += data_info.residuals[idx];
+    } else {
+      tentative_indicators[idx] = -1;  // go right
+      right_count++;
+      right_sum += data_info.residuals[idx];
+    }
+  }
+}
+
+// Routing-map variant of GetSufficientStatistics (birth).
+// Mode 1: skips NaN at split_var (they are drawn after acceptance).
+void GetSufficientStatistics(StanTree& tree, StanTree* target_leaf,
+                             size_t split_var, size_t cut_val,
+                             CutpointMatrix& cutpoints, DataInfo& data_info,
+                             size_t& left_count, double& left_sum,
+                             size_t& right_count, double& right_sum,
+                             RoutingMap& routing_map)
+{
+  left_count = 0;  left_sum  = 0.0;
+  right_count = 0; right_sum = 0.0;
+
+  for (size_t i = 0; i < data_info.n; i++) {
+    double* x_row = data_info.X + i * data_info.p;
+    if (target_leaf == tree.FindLeaf(x_row, i, cutpoints, routing_map)) {
+      if (std::isnan(x_row[split_var])) {
+        // For the MH ratio computation, skip NaN observations.
+        // They will be routed after acceptance via DrawRoutingIndicators.
+        continue;
+      }
+      if (x_row[split_var] < cutpoints[split_var][cut_val]) {
+        left_count++;
+        left_sum += data_info.residuals[i];
+      } else {
+        right_count++;
+        right_sum += data_info.residuals[i];
+      }
+    }
+  }
+}
+
+// Routing-map variant of GetSufficientStatistics (death).
+void GetSufficientStatistics(StanTree& tree, StanTree* left_leaf,
+                             StanTree* right_leaf,
+                             CutpointMatrix& cutpoints, DataInfo& data_info,
+                             size_t& left_count, double& left_sum,
+                             size_t& right_count, double& right_sum,
+                             RoutingMap& routing_map)
+{
+  left_count = 0;  left_sum  = 0.0;
+  right_count = 0; right_sum = 0.0;
+
+  for (size_t i = 0; i < data_info.n; i++) {
+    double* x_row = data_info.X + i * data_info.p;
+    const StanTree* leaf = tree.FindLeaf(x_row, i, cutpoints, routing_map);
+    if (leaf == left_leaf) {
+      left_count++;
+      left_sum += data_info.residuals[i];
+    }
+    if (leaf == right_leaf) {
+      right_count++;
+      right_sum += data_info.residuals[i];
+    }
+  }
+}
+
+// Routing-map variant of GetAllLeafStatistics.
+void GetAllLeafStatistics(StanTree& tree, CutpointMatrix& cutpoints,
+                          DataInfo& data_info,
+                          std::vector<StanTree*>& leaves,
+                          std::vector<size_t>& observation_counts,
+                          std::vector<double>& residual_sums,
+                          RoutingMap& routing_map)
+{
+  leaves.clear();
+  tree.CollectLeaves(leaves);
+
+  size_t num_leaves = leaves.size();
+  observation_counts.resize(num_leaves);
+  residual_sums.resize(num_leaves);
+
+  std::map<const StanTree*, size_t> leaf_index_map;
+  for (size_t i = 0; i < num_leaves; i++) {
+    leaf_index_map[leaves[i]] = i;
+    observation_counts[i]     = 0;
+    residual_sums[i]          = 0.0;
+  }
+
+  for (size_t i = 0; i < data_info.n; i++) {
+    double* x_row        = data_info.X + i * data_info.p;
+    const StanTree* leaf = tree.FindLeaf(x_row, i, cutpoints, routing_map);
+    size_t leaf_index    = leaf_index_map[leaf];
+    observation_counts[leaf_index]++;
+    residual_sums[leaf_index] += data_info.residuals[i];
+  }
+}
+
+// Routing-map variant of DrawAllLeafMeans.
+void DrawAllLeafMeans(StanTree& tree, CutpointMatrix& cutpoints,
+                      DataInfo& data_info, PriorInfo& prior_info,
+                      double sigma, Random& random,
+                      RoutingMap& routing_map)
+{
+  std::vector<StanTree*> leaves;
+  std::vector<size_t>    observation_counts;
+  std::vector<double>    residual_sums;
+  GetAllLeafStatistics(tree, cutpoints, data_info, leaves,
+                       observation_counts, residual_sums, routing_map);
+
+  for (size_t i = 0; i < leaves.size(); i++) {
+    leaves[i]->SetStepHeight(
+      DrawLeafMean(observation_counts[i], residual_sums[i],
+                   prior_info.eta, sigma, random));
+  }
+}
+
+// Routing-map variant with optional exclusion of NaN-routed observations.
+// When exclude_routed=true (modes 4-6), only observations that were
+// deterministically routed at every split contribute to (n_l, s_l).
+void DrawAllLeafMeans(StanTree& tree, CutpointMatrix& cutpoints,
+                      DataInfo& data_info, PriorInfo& prior_info,
+                      double sigma, Random& random,
+                      RoutingMap& routing_map, bool exclude_routed)
+{
+  if (!exclude_routed) {
+    DrawAllLeafMeans(tree, cutpoints, data_info, prior_info,
+                     sigma, random, routing_map);
+    return;
+  }
+
+  // Precompute which observations were routed at any split.
+  std::vector<bool> was_routed(data_info.n, false);
+  for (auto& entry : routing_map) {
+    const std::vector<int8_t>& ind = entry.second;
+    for (size_t i = 0; i < data_info.n; i++) {
+      if (ind[i] != 0) was_routed[i] = true;
+    }
+  }
+
+  // Collect leaves and build index map.
+  std::vector<StanTree*> leaves;
+  leaves.clear();
+  tree.CollectLeaves(leaves);
+
+  size_t num_leaves = leaves.size();
+  std::vector<size_t> observation_counts(num_leaves, 0);
+  std::vector<double> residual_sums(num_leaves, 0.0);
+
+  std::map<const StanTree*, size_t> leaf_index_map;
+  for (size_t i = 0; i < num_leaves; i++) {
+    leaf_index_map[leaves[i]] = i;
+  }
+
+  // Route all observations but only count non-routed ones.
+  for (size_t i = 0; i < data_info.n; i++) {
+    double* x_row = data_info.X + i * data_info.p;
+    const StanTree* leaf = tree.FindLeaf(x_row, i, cutpoints,
+                                         routing_map);
+    if (!was_routed[i]) {
+      size_t idx = leaf_index_map[leaf];
+      observation_counts[idx]++;
+      residual_sums[idx] += data_info.residuals[i];
+    }
+  }
+
+  for (size_t i = 0; i < num_leaves; i++) {
+    leaves[i]->SetStepHeight(
+      DrawLeafMean(observation_counts[i], residual_sums[i],
+                   prior_info.eta, sigma, random));
+  }
+}
+
