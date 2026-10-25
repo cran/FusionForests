@@ -1,8 +1,8 @@
 Package: FusionForests
 Type: Package
 Title: Bayesian Tree Ensembles for Data Fusion and Causal Inference
-Version: 1.0.1
-Date: 2026-08-01
+Version: 1.1.1
+Date: 2026-10-24
 Authors@R: c(person("Tijn", "Jacobs", role = c("aut", "cre"), 
                     email = "t.jacobs@vu.nl", 
                     comment = c(ORCID = "0009-0003-6188-9296")))
@@ -20,13 +20,15 @@ License: MIT + file LICENSE
 Depends: R (>= 3.5.0)
 Imports: Rcpp, ShrinkageTrees
 LinkingTo: Rcpp (>= 1.0.11)
-Suggests: survival, testthat (>= 3.0.0)
+Suggests: knitr, rmarkdown, survival, testthat (>= 3.0.0)
+VignetteBuilder: knitr
 Encoding: UTF-8
+LazyData: true
 Config/testthat/edition: 3
 Config/roxygen2/version: 8.0.0
 RoxygenNote: 7.3.3
 NeedsCompilation: yes
-Packaged: 2026-08-01 16:49:27 UTC; tijnjacobs
+Packaged: 2026-10-24 09:08:17 UTC; tijnjacobs
 Author: Tijn Jacobs [aut, cre] (ORCID: <https://orcid.org/0009-0003-6188-9296>)
 Repository: CRAN
-Date/Publication: 2026-08-09 06:40:10 UTC
+Date/Publication: 2026-10-25 22:00:22 UTC

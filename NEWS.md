@@ -1,3 +1,39 @@
+# FusionForests 1.1.1
+
+- The sampler for the centred error mixture is now exact.  It samples the
+  uncentred (parameter-expanded) mixture, whose full conditionals are all
+  conjugate, and centres every stored draw afterwards (Yang et al., 2010):
+  the RCT mixture mean is added to `m0_sh` and the difference of the two
+  source means to `d`; the atoms are shifted to mean zero.  Previously the
+  forests conditioned on the centred atoms while the atoms and weights were
+  updated as in the uncentred model.  `tau` and `c` are unaffected; `m0_sh`
+  and `d` now carry the source-specific error means.  Draws are not
+  bit-identical to 1.1.0.
+- The baseline forest now fits the current augmented outcome; it used to see
+  the outcome from one sweep earlier.
+- `dp_mu_g` is returned for every mixture error model, and the mixture
+  outputs are documented in full.
+- With `k_deviation = 0` and a source-specific error model, `d` equals the
+  constant difference of the source-specific error means.
+
+# FusionForests 1.1.0
+
+- New data sets `breast_fusion` and `breast_fusion_truth`.
+- The `k_*` arguments now follow the paper's scaling
+  σ_h = k / (2√J), with defaults `k = 1` and `k_treat = 0.5`. Double old
+  `k_*` values to reproduce earlier fits.
+- The default `error_dist` is now `"source_hdp_scale"`.
+- New `error_dist = "source_gaussian"`: a normal error with a separate
+  scale per source.
+- `fusion_estimand()` now respects `treatment_coding` and per-source
+  error scales.
+- The survival difference for `target_source = "rwd"` is now causal: it
+  uses `tau` only and no longer adds the confounding function `c`.
+- Removed `SimpleBART()`, `SimpleBCF()`, the `decomposition` argument
+  and the `"RMST"` estimand.
+- `FusionForest()` now errors on missing covariate values.
+- Documentation in the paper's notation, code cleanup and more tests.
+
 # FusionForests 1.0.1
 
 - Internal cleanup of the C++ layer for CRAN portability: removed

@@ -1,4 +1,4 @@
-# FusionForests <img src="https://img.shields.io/badge/R%3E%3D-3.5-blue" alt="R >= 3.5"> ![License: MIT](https://img.shields.io/badge/license-MIT-green)
+# FusionForests <img src="https://img.shields.io/badge/R%3E%3D-3.5-blue" alt="R >= 3.5"> ![License: MIT](https://img.shields.io/badge/license-MIT-green) ![Lifecycle: stable](https://img.shields.io/badge/lifecycle-stable-brightgreen) [![](https://cranlogs.r-pkg.org/badges/grand-total/FusionForests)](https://cran.r-project.org/package=FusionForests)
 
 <img src="sticker/FusionForests_hex.png" align="right" width="150"/>
 
@@ -10,30 +10,46 @@ framework. Crucially, the observational data are **not** assumed to be
 unconfounded.
 
 The model targets heterogeneous treatment effects on continuous and
-(interval-)censored survival outcomes. The outcome is decomposed over
-separate tree forests:
+(interval-)censored survival outcomes. Using an accelerated failure
+time specification, the outcome is decomposed over separate tree
+forests:
 
-$$Y = \mu(X) + (1-S)\ g(X) + A\ \tau(X) + (1-S)\ A\ c(X) + \varepsilon,$$
+$$\log T = m_0^{\mathrm{sh}}(X) + (1-S)\,d(X) + A\,\tau(X) + (1-S)\,A\,c(X) + \varepsilon,$$
 
-where $Y$ is the log survival time (accelerated failure time
-formulation) or a continuous outcome, $A$ is the treatment, $S$
-indicates the source ($S = 1$ for the RCT, $S = 0$ for the RWD), and
+where $T$ is the survival time (for a continuous outcome, $\log T$ is
+replaced by the outcome itself), $A$ is the treatment, $S$ indicates
+the source ($S = 1$ for the RCT, $S = 0$ for the RWD), and
 $\varepsilon$ is a mean-zero error term — Gaussian or a flexible
 Dirichlet-process mixture. Each term is modelled by its own forest:
 
-- $\mu(X)$ — **control forest**: the prognostic surface under control;
-- $g(X)$ — **deconfounding forest**: an RWD-only shift that absorbs
-  confounding in the observational data;
-- $\tau(X)$ — **treatment forest**: the heterogeneous treatment effect,
-  identified by the RCT;
-- $c(X)$ — **deviation forest**: how the RWD treatment effect deviates
-  from the RCT one.
+- $m_0^{\mathrm{sh}}(X)$ — **baseline forest**: the baseline log survival time under
+  control, shared across both sources (`control` arguments);
+- $d(X)$ — **deviation forest**: how the baseline in the RWD deviates
+  from the one in the RCT (`deviation` arguments);
+- $\tau(X)$ — **treatment forest**: the heterogeneous treatment effect
+  (`treat` arguments);
+- $c(X)$ — **confounding forest**: the bias in the RWD treatment
+  contrast caused by unmeasured confounding (`deconf` arguments).
 
-Because the RWD-specific terms $g(X)$ and $c(X)$ absorb confounding,
-the RCT anchors identification of $\tau(X)$ while the observational
-data add precision — without assuming the RWD is unconfounded.
+The real-world data alone identify only the sum $\tau(x) + c(x)$. The
+trial anchors $\tau$, so the observational data add precision without
+their confounding leaking into the treatment effect estimate.
+
+## Reference
+
+The methodology is described in:
+
+> _Bayesian fusion forests for heterogeneous treatment effects on survival from randomised and real-world data_
+> T. Jacobs, S.L. van der Pas, W.N. van Wieringen
+> https://arxiv.org/abs/2607.29295
 
 ## Installation
+
+Install the released version from CRAN:
+
+```r
+install.packages("FusionForests")
+```
 
 The development version can be installed from GitHub:
 
@@ -105,6 +121,20 @@ confounder, the fitted treatment effects track the truth (correlation
 0.89) and the 95% credible intervals cover the true effect for 94% of
 subjects.
 
+## Vignette
+
+The vignette walks through a complete analysis of the semi-synthetic
+`breast_fusion` data, which ship with the package. It covers the model
+fit, single-source comparisons, causal estimands, posterior projections,
+the confounding function and the error model. Open it in R with:
+
+```r
+vignette("FusionForests")
+```
+
+It is also available on
+[CRAN](https://cran.r-project.org/package=FusionForests/vignettes/FusionForests.html).
+
 ## The FusionForest model
 
 `FusionForest()` is the heart of the package. It fits the decomposition
@@ -124,14 +154,6 @@ The single-study causal and survival models from the
 [ShrinkageTrees](https://cran.r-project.org/package=ShrinkageTrees)
 package are re-exported, so `library(FusionForests)` provides every
 model from the accompanying paper in one namespace.
-
-## Reference
-
-The methodology is described in:
-
-> _Bayesian fusion forests for heterogeneous treatment effects on survival from randomised and real-world data_
-> T. Jacobs, S.L. van der Pas, W.N. van Wieringen
-> arXiv preprint (2026)
 
 ## License
 

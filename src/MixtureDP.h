@@ -4,10 +4,21 @@
 #include "Prerequisites.h"
 #include <vector>
 
-// Centered Dirichlet process mixture of Gaussians on the residual distribution,
-// adapted from Henderson et al. (2020, Biostatistics) and Yang et al. (2010).
+// Centred Dirichlet process mixture of Gaussians on the residual distribution,
+// after Henderson et al. (2020, Biostatistics) and Yang et al. (2010).
 //
-// Six modes:
+// Parameter expansion.  The Gibbs sweep works with the *uncentred* mixture:
+// the working atoms locations_[g][k] (the shared theta_k* in the HDP modes)
+// enter the forests' partial residuals, the label step, the sigma_g step and
+// the censored-time augmentation as they are.  The centring of the paper,
+// theta_k - mu_s with mu_s = sum_k pi_sk theta_k*, is applied to the output
+// only (locations_centered_, mu_g_); the caller adds mu_s to the baseline
+// forests so that each stored draw is a draw of the centred model.  This is
+// the post-processing scheme of Yang et al. (2010): every full conditional of
+// the working model is conjugate, and the likelihood is invariant under the
+// centring map.
+//
+// Seven modes:
 //   GAUSSIAN        : no mixture, single normal residual (this class is a no-op)
 //   SHARED_DP       : one DP pooled across all observations
 //   SOURCE_DP       : independent DPs per data source, shared sigma (Stage A)
@@ -25,6 +36,10 @@
 //                     residual scale.  Label sampling and shared-atom posterior
 //                     use the per-source sigma_g; sigma_g is updated each sweep
 //                     via the same IG conjugate step as SOURCE_DP_SCALE.
+//   SOURCE_GAUSSIAN : a single normal residual per source, each with its own
+//                     scale sigma_g.  Implemented as a one-component mixture
+//                     (run with K = 1) whose location stays fixed at zero, so
+//                     each sweep only updates sigma_g.
 //
 // Per-source state is held in std::vector-of-vector containers indexed by
 // group g in [0, num_groups_).  SHARED_DP uses num_groups_ = 1; all SOURCE_*
@@ -34,7 +49,7 @@ class MixtureDP {
 public:
   enum Mode { GAUSSIAN = 0, SHARED_DP = 1, SOURCE_DP = 2,
               SOURCE_DP_SCALE = 3, SOURCE_HDP = 4,
-              SOURCE_HDP_SCALE = 5 };
+              SOURCE_HDP_SCALE = 5, SOURCE_GAUSSIAN = 6 };
 
   MixtureDP(int mode, size_t n_total, size_t K,
             double prior_atom_variance,
@@ -50,29 +65,42 @@ public:
   int num_groups() const       { return num_groups_; }
 
   // Run one Gibbs sweep of the DP block (labels -> tabulate -> stick weights
-  // & concentration -> atoms with centring).  No-op when GAUSSIAN.
+  // & concentration -> uncentred atoms -> centring for output).  No-op when
+  // GAUSSIAN.
   // `residuals` has length n_total_ and equals y - total_predictions.
   void Update(const double* residuals, double sigma, Random& random);
 
-  // Fill theta_shift[i] (length n_total_) with the current centred atom for
-  // observation i.  Fills zeros when GAUSSIAN.
+  // Fill theta_shift[i] (length n_total_) with the current *uncentred*
+  // working atom of observation i's cluster.  Fills zeros when GAUSSIAN.
   void GetIndividualShifts(double* theta_shift) const;
 
   const std::vector<double>& mix_prop(int g)  const { return mix_prop_[g];  }
-  const std::vector<double>& locations(int g) const { return locations_[g]; }
+  // Centred atoms theta_k - mu_g of group g, for output only.
+  const std::vector<double>& locations(int g) const { return locations_centered_[g]; }
   double mass(int g) const                          { return mass_[g];      }
 
-  // Per-source error scale (only meaningful in SOURCE_DP_SCALE; equals
-  // sigma_init for the other modes).
+  // Mean mu_s = sum_k pi_sk theta_k of the uncentred working mixture in
+  // source s (0 = RWD, 1 = RCT).  Zero for the Gaussian modes; the single
+  // group's mean for SHARED_DP.
+  double mu_source(int s) const {
+    if (mu_g_.empty()) return 0.0;
+    return (num_groups_ == 1) ? mu_g_[0] : mu_g_[s];
+  }
+
+  // Per-source error scale (only meaningful in the per-source scale modes
+  // SOURCE_DP_SCALE, SOURCE_HDP_SCALE and SOURCE_GAUSSIAN; equals sigma_init
+  // for the other modes).
   double sigma_g(int g) const { return sigma_g_[g]; }
 
   // sqrt of weight-by-group pooled variance.  Used as the reference sigma the
   // caller passes to forest backfitting; weights compensate per observation.
   double sigma_pooled() const;
 
+  // Per-group mixture means (all non-Gaussian modes).
+  const std::vector<double>& mu_g_vec()         const { return mu_g_;             }
+
   // HDP-only accessors (return empty / zero for other modes).
   const std::vector<double>& locations_shared() const { return locations_shared_; }
-  const std::vector<double>& mu_g_vec()         const { return mu_g_;             }
   const std::vector<double>& beta()             const { return beta_;             }
   double gamma_top() const { return gamma_top_; }
 
@@ -93,14 +121,16 @@ private:
 
   std::vector<std::vector<int>>    labels_;          // labels_[g][jj] in 1..K
   std::vector<std::vector<double>> mix_prop_;        // mix_prop_[g][k]
-  std::vector<std::vector<double>> locations_;       // locations_[g][k] (centred)
+  std::vector<std::vector<double>> locations_;          // working (uncentred) atoms; HDP: copy of locations_shared_
+  std::vector<std::vector<double>> locations_centered_; // locations_[g][k] - mu_g_[g], output only
   std::vector<std::vector<int>>    cluster_counts_;  // cluster_counts_[g][k]
   std::vector<double>              mass_;            // mass_[g]
   std::vector<double>              sigma_g_;         // sigma_g_[g], only updated in SCALE mode
 
-  // HDP-only state (allocated only when mode_ == SOURCE_HDP).
+  std::vector<double>              mu_g_;               // length num_groups_ -- per-source mu_s (all non-Gaussian modes)
+
+  // HDP-only state (allocated only when mode_ is SOURCE_HDP or SOURCE_HDP_SCALE).
   std::vector<double>              locations_shared_;   // length K -- unconstrained atoms theta_k*
-  std::vector<double>              mu_g_;               // length num_groups_ -- per-source mu_s
   std::vector<double>              beta_;               // length K -- top-level sticks
   double                           gamma_top_;          // top-level concentration
   std::vector<std::vector<int>>    table_counts_;       // table_counts_[g][k] = t_{sk}
@@ -112,14 +142,17 @@ private:
   void updateSigmaGroup    (int g, const double* residuals, Random& random);
 
   // HDP Gibbs steps
-  void updateLabelsGroupHDP(int g, const double* residuals, double sigma, Random& random);
   void updateAtomsShared   (const double* residuals, double sigma, Random& random);
   void updateAtomsSharedPerSourceSigma(const double* residuals, Random& random);
   void updateBeta          (Random& random);
   void updateMixHDP        (int g, Random& random);
   void updateMassHDP       (int g, Random& random);
   void updateGamma         (Random& random);
-  void recomputeCenteredLocations();
+
+  // Centring for output: sync the working atoms (HDP), recompute mu_g_[g]
+  // and locations_centered_[g].  Called once pi and the atoms are final.
+  void recomputeCenteringGroup(int g);
+  void recomputeCentering();
 };
 
 #endif // MIXTUREDP_H
